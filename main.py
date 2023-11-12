@@ -8,7 +8,9 @@ import os
 import torch
 import numpy as np
 import wandb
+import datetime
 
+os.environ['WANDB_DISABLED'] = 'true'
 from runners.diffusion import Diffusion
 
 torch.set_printoptions(sci_mode=False)
@@ -184,7 +186,10 @@ def parse_args_and_config():
 def set_log_path(args, config):
     train = args.eval_path is None
     if train:
-        args.log_path = os.path.join(args.exp, "logs", wandb.run.id)
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.log_path = os.path.join(args.exp) #("Test/logs/20231020_145502")#(args.exp, "logs", timestamp)
+
+        # args.log_path = os.path.join(args.exp, "logs"cndb.run.id)
         if not args.resume_training:
             if os.path.exists(args.log_path):
                 overwrite = False
@@ -264,15 +269,17 @@ def main():
                 unpacked_config = {**unpacked_config, **inner_dict}
             else:
                 unpacked_config[k] = v
-        wandb.init(entity='universal-conditional-ddpm', project='universal-conditional-ddpm',
+        wandb.init(project='GSDM',
                    config={**unpacked_config, **args.__dict__}, id=args.resume_id, tags=args.wandb_tags)
         set_log_path(args, config)
         # ---------------------------------------------------
+
         if args.eval_path is None:
             logging.info("Writing log file to {}".format(args.log_path))
             logging.info("Exp instance id = {}".format(os.getpid()))
             logging.info("Exp comment = {}".format(args.comment))
             runner.train()
+
         else:
             runner.evaluate()
     except Exception:

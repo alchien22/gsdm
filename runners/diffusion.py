@@ -3,6 +3,7 @@ import logging
 import time
 import glob
 import itertools
+import bdb
 
 import numpy as np
 import tqdm
@@ -158,6 +159,7 @@ class Diffusion(object):
 
         start_epoch, step = 0, 0
         if self.args.resume_training:
+            import pdb; pdb.set_trace()
             states = torch.load(os.path.join(self.args.log_path, "ckpt.pth"))
             model.load_state_dict(states[0])
 
@@ -173,129 +175,148 @@ class Diffusion(object):
             wandb.log({'log_loss_weights': wandb.Histogram(loss_weights.cpu().log())})
         else:
             loss_weights = None
-        for epoch in range(start_epoch, self.config.training.n_epochs):
-            epoch_start = time.time()
-            data_start = time.time()
-            data_time = 0
-            repeating_train_loader = itertools.cycle(train_loader)
-            for i, batch in zip(range(config.training.max_epoch_iters), repeating_train_loader):
-                data_time += time.time() - data_start
-                model.train()
-                step += 1
+        try:
+            for epoch in range(start_epoch, self.config.training.n_epochs):
+                epoch_start = time.time()
+                data_start = time.time()
+                data_time = 0
+                repeating_train_loader = itertools.cycle(train_loader)
+                for i, batch in zip(range(config.training.max_epoch_iters), repeating_train_loader):
+                    data_time += time.time() - data_start
+                    model.train()
+                    step += 1
 
-                data_dims = None
-                if self.config.data.vary_dimensions:
-                    data_dims = [dim[0] for dim in batch[3]]
-                    dataset.set_dims(data_dims)
-                    model_dims = batch[2]
-                    model.module.reset_dimensions(model_dims, data_dims, log_stats=(i % self.args.log_freq == 0))
+                    data_dims = None
+                    if self.config.data.vary_dimensions:
+                        data_dims = [dim[0] for dim in batch[3]]
+                        dataset.set_dims(data_dims)
+                        model_dims = batch[2]
+                        model.module.reset_dimensions(model_dims, data_dims, log_stats=(i % self.args.log_freq == 0))
 
-                # VAEAC expects data to just be a float array, with discrete values represented as integers
-                if args.vaeac:
-                    dequant_log_prob = torch.tensor(0.)
-                    cont, disc = batch[0], batch[1]
-                    x = torch.cat([cont.to(torch.float32), disc.to(torch.float32)], dim=1)
-                else:
-                    x, dequant_log_prob = model.module.dequantize(batch[0:2])
-                    dequant_log_prob = dequant_log_prob.mean()
+                    # VAEAC expects data to just be a float array, with discrete values represented as integers
+                    if args.vaeac:
+                        dequant_log_prob = torch.tensor(0.)
+                        cont, disc = batch[0], batch[1]
+                        x = torch.cat([cont.to(torch.float32), disc.to(torch.float32)], dim=1)
+                    else:
+                        x, dequant_log_prob = model.module.dequantize(batch[0:2])
+                        dequant_log_prob = dequant_log_prob.mean()
 
-                n = x.size(0)
-                x = x.to(self.device)
-                e = torch.randn_like(x)
-                b = self.betas
+                    n = x.size(0)
+                    x = x.to(self.device)
+                    e = torch.randn_like(x)
+                    b = self.betas
 
-                # antithetic sampling
-                t = torch.randint(
-                    low=0, high=self.num_timesteps, size=(n // 2 + 1,)
-                ).to(self.device)
-                t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
-                obs_mask = dataset.sample_obs_mask(len(x), self.device)
+                    # antithetic sampling
+                    t = torch.randint(
+                        low=0, high=self.num_timesteps, size=(n // 2 + 1,)
+                    ).to(self.device)
+                    t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
+                    obs_mask = dataset.sample_obs_mask(len(x), self.device)
+
+                    if args.just_save_data_to != "":
+                        # save groundtruth data
+                        with open(args.just_save_data_to+'_groundtruth.tsv', 'a') as fg, open(args.just_save_data_to+'_train.tsv', 'a') as ft:
+                            disc = batch[1].cpu().numpy()
+                            is_obs = obs_mask['emb'].cpu().numpy()
+                            for row, obs_row in zip(disc, is_obs):
+                                fg.write('\t'.join(str(el) for el in row) + '\n')
+                                ft.write('\t'.join(str(el) if o else 'nan' for el, o in zip(row, obs_row)) + '\n')
+                        continue
+
+                    if self.config.data.supervise_intermediate:
+                        loss_mask = None
+                    else:
+                        mask = dataset.intermediate_mask
+                        loss_mask = (1 - mask).to(self.device)
+                        x = x * loss_mask
+                        e = e * loss_mask
+
+                    if args.vaeac:
+                        mask = obs_mask["emb"].squeeze(2)
+                        loss = -model.module.batch_vlb(x, 1-mask)
+                        loss = loss.sum() / x.numel()
+                        mse_loss = 0.
+                    else:
+                        mse_loss = loss_registry[config.model.type](model, x, t, e, b, w=loss_weights,
+                                                                    predict=self.config.model.predict,
+                                                                    obs_mask=obs_mask,
+                                                                    log_attn=False,
+                                                                    mean_over_latents=config.training.mean_latents_loss,
+                                                                    loss_mask=loss_mask,
+                                                                    regression=self.args.regression)
+                        loss = mse_loss - dequant_log_prob.to(mse_loss.device)
+                    do_attn_reg = self.config.model.attn_reg_lambda != 0 and i+epoch*config.training.max_epoch_iters < config.training.attn_reg_iters
+
+                    if do_attn_reg:
+                        loss = -model.module.attn_reward  # only use attn reward for first 1000 iters
+
+                    logging.info(
+                        f"step: {step}, loss: {loss.item()}, data time: {data_time / (i+1)}, epoch: {epoch}"
+                    )
+
+                    optimizer.zero_grad()
+                    loss.backward()
+
+                    if self.args.vaeac:
+                        grad_norm = 0.
+                    else:
+                        try:
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), config.optim.grad_clip
+                            )
+                        except Exception:
+                            pass
+                    optimizer.step()
+
+                    if self.config.model.ema:
+                        ema_helper.update(model)
+
+                    if i % self.args.log_freq == 0:
+                        wandb.log({'loss': loss, 'epoch': epoch, 'iter': i, 'dequant_log_prob': dequant_log_prob,
+                                'mse_loss': mse_loss, 'grad_norm': grad_norm})
+
+
+                    if step % self.config.training.snapshot_freq == 0 or step == 1:
+                        states = [
+                            model.state_dict(),
+                            optimizer.state_dict(),
+                            epoch,
+                            step,
+                        ]
+                        if self.config.model.ema:
+                            states.append(ema_helper.state_dict())
+
+                        torch.save(
+                            states,
+                            os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
+                        )
+                        torch.save(states, os.path.join(self.args.log_path, "ckpt.pth"))
+
+                    data_start = time.time()
 
                 if args.just_save_data_to != "":
-                    # save groundtruth data
-                    with open(args.just_save_data_to+'_groundtruth.tsv', 'a') as fg, open(args.just_save_data_to+'_train.tsv', 'a') as ft:
-                        disc = batch[1].cpu().numpy()
-                        is_obs = obs_mask['emb'].cpu().numpy()
-                        for row, obs_row in zip(disc, is_obs):
-                            fg.write('\t'.join(str(el) for el in row) + '\n')
-                            ft.write('\t'.join(str(el) if o else 'nan' for el, o in zip(row, obs_row)) + '\n')
                     continue
+                wandb.log({'epoch_time': time.time()-epoch_start})
+                self.validate(model=model, ema_helper=ema_helper, iteration=step)
+        except (KeyboardInterrupt, bdb.BdbQuit): 
+            print('Training interrupted. Saving model...')
+            states = [
+                model.state_dict(),
+                optimizer.state_dict(),
+                epoch,
+                step,
+            ]
+            if self.config.model.ema:
+                states.append(ema_helper.state_dict())
 
-                if self.config.data.supervise_intermediate:
-                    loss_mask = None
-                else:
-                    mask = dataset.intermediate_mask
-                    loss_mask = (1 - mask).to(self.device)
-                    x = x * loss_mask
-                    e = e * loss_mask
+            torch.save(
+                states,
+                os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
+            )
+            torch.save(states, os.path.join(self.args.log_path, "ckpt.pth"))
+            # model._save_to_state_dict()
 
-                if args.vaeac:
-                    mask = obs_mask["emb"].squeeze(2)
-                    loss = -model.module.batch_vlb(x, 1-mask)
-                    loss = loss.sum() / x.numel()
-                    mse_loss = 0.
-                else:
-                    mse_loss = loss_registry[config.model.type](model, x, t, e, b, w=loss_weights,
-                                                                predict=self.config.model.predict,
-                                                                obs_mask=obs_mask,
-                                                                log_attn=False,
-                                                                mean_over_latents=config.training.mean_latents_loss,
-                                                                loss_mask=loss_mask,
-                                                                regression=self.args.regression)
-                    loss = mse_loss - dequant_log_prob.to(mse_loss.device)
-                do_attn_reg = self.config.model.attn_reg_lambda != 0 and i+epoch*config.training.max_epoch_iters < config.training.attn_reg_iters
-
-                if do_attn_reg:
-                    loss = -model.module.attn_reward  # only use attn reward for first 1000 iters
-
-                logging.info(
-                    f"step: {step}, loss: {loss.item()}, data time: {data_time / (i+1)}"
-                )
-
-                optimizer.zero_grad()
-                loss.backward()
-
-                if self.args.vaeac:
-                    grad_norm = 0.
-                else:
-                    try:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), config.optim.grad_clip
-                        )
-                    except Exception:
-                        pass
-                optimizer.step()
-
-                if self.config.model.ema:
-                    ema_helper.update(model)
-
-                if i % self.args.log_freq == 0:
-                    wandb.log({'loss': loss, 'epoch': epoch, 'iter': i, 'dequant_log_prob': dequant_log_prob,
-                               'mse_loss': mse_loss, 'grad_norm': grad_norm})
-
-
-                if step % self.config.training.snapshot_freq == 0 or step == 1:
-                    states = [
-                        model.state_dict(),
-                        optimizer.state_dict(),
-                        epoch,
-                        step,
-                    ]
-                    if self.config.model.ema:
-                        states.append(ema_helper.state_dict())
-
-                    torch.save(
-                        states,
-                        os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
-                    )
-                    torch.save(states, os.path.join(self.args.log_path, "ckpt.pth"))
-
-                data_start = time.time()
-
-            if args.just_save_data_to != "":
-                continue
-            wandb.log({'epoch_time': time.time()-epoch_start})
-            self.validate(model=model, ema_helper=ema_helper, iteration=step)
 
     def validate(self, model, ema_helper, iteration):
         vis_start = time.time()
@@ -321,8 +342,24 @@ class Diffusion(object):
                      for op in obs_props]
         mask_descs = [f'-obs-{op}' for op in obs_props]
 
+        args, config = self.args, self.config
+        dataset, test_dataset = get_dataset(args, config)
+        self.dataset = dataset
 
+        valid_loader = data.DataLoader(
+            test_dataset,
+            batch_size=config.sampling.sampling_batch_size,
+            shuffle=False,
+            num_workers=config.data.num_workers,
+        )
+        self.valid_batch = next(iter(valid_loader))
+
+        i = 0
         for obs_prop, obs_mask, desc in zip(obs_props, obs_masks, mask_descs):
+            print("Step", i)
+            i += 1
+            if i % 10 == 0:
+                break
             sampling_start_time = time.time()
             self.log_samples(valid_model, self.valid_batch, obs_mask=obs_mask, prefix=desc+'-ema')
             sampling_time = time.time() - sampling_start_time

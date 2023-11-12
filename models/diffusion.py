@@ -416,13 +416,16 @@ class TransformerModel(nn.Module):
             xs = [cont_x]
         else:
             xs = []
+        
         index = NC
         for n_options in set(self.n_discrete_options):
             n_var = sum(el == n_options for el in self.n_discrete_options)
             emb_bit = emb[:, index:index+n_var].permute(0, 2, 1)   # B x emb_dim x n_var
             x_bit = self.disc_out_projs[str(n_options)](emb_bit)
+            
             if self.config.model.softmax:
                 x_bit = torch.softmax(x_bit, dim=1)
+            
             x_bit = x_bit.permute(0, 2, 1)  # B x n_var x n_options
             x_bit = x_bit.reshape(B, -1)
             xs.append(x_bit)

@@ -62,5 +62,5 @@ training: !!python/object:argparse.Namespace
   max_epoch_iters: 5000
   mean_latents_loss: false
   n_epochs: 1000
-  snapshot_freq: 1000
+  snapshot_freq: 5000
   validation_freq: 2000

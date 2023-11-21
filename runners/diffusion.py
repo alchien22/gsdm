@@ -197,6 +197,8 @@ class Diffusion(object):
                     if args.vaeac:
                         dequant_log_prob = torch.tensor(0.)
                         cont, disc = batch[0], batch[1]
+                        cont = cont.to(self.device)
+                        disc = disc.to(self.device)
                         x = torch.cat([cont.to(torch.float32), disc.to(torch.float32)], dim=1)
                     else:
                         x, dequant_log_prob = model.module.dequantize(batch[0:2])
@@ -204,7 +206,7 @@ class Diffusion(object):
 
                     n = x.size(0)
                     x = x.to(self.device)
-                    e = torch.randn_like(x)
+                    e = torch.randn_like(x).to(self.device)
                     b = self.betas
 
                     # antithetic sampling
@@ -379,7 +381,11 @@ class Diffusion(object):
         batch, obs_mask = self.dataset.condition_batch(batch, obs_mask)
         if self.args.vaeac:
             cont, disc = batch[0], batch[1]
+            cont = cont.to(self.device)
+            disc = disc.to(self.device)
             gt_cont, gt_disc = batch[0], batch[1]
+            gt_cont = gt_cont.to(self.device)
+            gt_disc = gt_disc.to(self.device)
             x = torch.cat([cont.to(torch.float32), disc.to(torch.float32)], dim=1).to(self.device)
             unobs_mask = 1-obs_mask['emb'].squeeze(2)
             likelihood = model.module.generate_samples_params(x, mask=unobs_mask)
@@ -389,12 +395,18 @@ class Diffusion(object):
             samples = samples * unobs_mask + x * (1-unobs_mask)
             samples_cont, samples_disc = samples[:, :n_cont].detach().cpu(), samples[:, n_cont:].detach().cpu()
             samples_disc = samples_disc.to(torch.int64)
+            samples_disc = samples_disc.to(self.device)
+            samples_cont = samples_cont.to(self.device)
         else:
             gt_cont, gt_disc = batch[0], batch[1]
+            gt_cont = gt_cont.to(self.device)
+            gt_disc = gt_disc.to(self.device)
             data = model.module.dequantize(batch[:2])[0].to(self.device)
             xT = model.module.sample_xT(self.config.sampling.sampling_batch_size)
             samples = self.sample(xT, model, obs=data, obs_mask=obs_mask)
             samples_cont, samples_disc = model.module.requantize(samples)
+            samples_cont = samples_cont.to(self.device)
+            samples_disc = samples_disc.to(self.device)
 
         dataset_metrics = self.dataset.validation_metrics(samples_disc, samples_cont, gt_cont=gt_cont, gt_disc=gt_disc, model=model)
 
@@ -478,7 +490,7 @@ class Diffusion(object):
             skip = 1
 
         if self.args.regression:
-            z = torch.zeros_like(x)
+            z = torch.zeros_like(x).to(self.device)
             t = torch.zeros(x.size(0), device=self.device)
             obs = obs * obs_mask["xt"]
             output = model(z, t, log_attn=False, obs=obs, obs_mask=obs_mask)

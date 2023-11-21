@@ -11,13 +11,14 @@ class EMAHelper(object):
             module = module.module
         for name, param in module.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+                self.shadow[name] = param.data.clone().to(param.device)
 
     def update(self, module):
         if isinstance(module, nn.DataParallel):
             module = module.module
         for name, param in module.named_parameters():
             if param.requires_grad:
+                self.shadow[name].data = self.shadow[name].data.to(param.device)
                 self.shadow[name].data = (
                     1. - self.mu) * param.data + self.mu * self.shadow[name].data
 
